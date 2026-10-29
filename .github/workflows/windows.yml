@@ -44,8 +44,8 @@ jobs:
         run: >
           cmake -S . -B build -G "Visual Studio 17 2022" -A x64
           "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-          -DVCPKG_TARGET_TRIPLET=$env:TRIPLET
-          -DVCPKG_HOST_TRIPLET=$env:TRIPLET
+          "-DVCPKG_TARGET_TRIPLET=$env:TRIPLET"
+          "-DVCPKG_HOST_TRIPLET=$env:TRIPLET"
 
       # 首次编译依赖耗时较长，失败时也保存已编好的包，下次可续上
       - name: Save vcpkg binary cache
