@@ -5,6 +5,8 @@
 #include <osg/Group>
 #include <osg/LineWidth>
 #include <osg/Node>
+#include <osg/NodeVisitor>
+#include <osg/Texture>
 #include <osgText/Text>
 #include <osgText/Font>
 #include <osgDB/ReadFile>
@@ -22,11 +24,18 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <set>
 
 #ifdef __APPLE__
 #include <objc/objc.h>
 #include <objc/message.h>
 #include <mach-o/dyld.h>
+#endif
+
+#ifdef _WIN32
+#include <windows.h>
+#include <shobjidl.h>
+#include <shellapi.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -62,8 +71,19 @@ static std::string toLower(std::string s) {
     return s;
 }
 
+// 路径转 UTF-8 字符串：用于 osgDB 文件名与界面显示。
+// Windows 版 OSG（vcpkg 构建）启用了 OSG_USE_UTF8_FILENAME，文件名须为 UTF-8；
+// 且 path::string() 在 Windows 上走 ANSI 代码页，中文路径会丢字
+static std::string u8(const fs::path& p) {
+#ifdef _WIN32
+    return p.u8string();
+#else
+    return p.string();
+#endif
+}
+
 static bool hasWantedExt(const fs::path& p) {
-    return toLower(p.extension().string()) == ".osgb";
+    return toLower(u8(p.extension())) == ".osgb";
 }
 
 // macOS Retina：帧缓冲是物理像素，而 OSG 的 Cocoa 窗口按逻辑像素上报尺寸，
@@ -84,14 +104,23 @@ static float displayScale() {
 // 内置默认字体偏粗糙，优先加载系统字体（经 freetype 插件）
 static osgText::Font* uiFont() {
     static osg::ref_ptr<osgText::Font> font = []() -> osg::ref_ptr<osgText::Font> {
-        const char* candidates[] = {
+        std::vector<fs::path> candidates;
+#ifdef _WIN32
+        const char* windir = std::getenv("WINDIR");
+        fs::path fonts = fs::path(windir ? windir : "C:\\Windows") / "Fonts";
+        for (const char* n : {"arial.ttf", "segoeui.ttf", "tahoma.ttf"})
+            candidates.push_back(fonts / n);
+#else
+        candidates = {
             "/System/Library/Fonts/Supplemental/Arial.ttf",
             "/System/Library/Fonts/Helvetica.ttc",
             "/System/Library/Fonts/Monaco.ttf",
         };
-        for (const char* p : candidates) {
-            if (!fs::exists(p)) continue;
-            osg::ref_ptr<osgText::Font> f = osgText::readRefFontFile(p);
+#endif
+        for (const fs::path& p : candidates) {
+            std::error_code ec;
+            if (!fs::exists(p, ec)) continue;
+            osg::ref_ptr<osgText::Font> f = osgText::readRefFontFile(u8(p));
             if (f) return f;
         }
         std::cerr << "Warning: no usable UI font found, text may be invisible.\n";
@@ -126,7 +155,7 @@ static std::vector<fs::path> collectModelFiles(const fs::path& dir) {
     }
     std::sort(files.begin(), files.end(),
               [](const fs::path& a, const fs::path& b){
-                  return a.filename().string() < b.filename().string();
+                  return a.filename() < b.filename();
               });
     return files;
 }
@@ -136,9 +165,45 @@ static std::string truncateName(const std::string& s, size_t maxLen = 28) {
     return s.size() <= maxLen ? s : s.substr(0, maxLen - 3) + "...";
 }
 
-// 弹出 macOS 原生文件夹选择框（经 osascript），取消或失败返回空串
-static std::string pickFolderDialog(const fs::path& defaultDir) {
-#ifdef __APPLE__
+// 弹出系统原生文件夹选择框，取消或失败返回空路径。
+// macOS 经 osascript；Windows 用 IFileOpenDialog（FOS_PICKFOLDERS）
+static fs::path pickFolderDialog(const fs::path& defaultDir) {
+#if defined(_WIN32)
+    fs::path result;
+    HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    IFileOpenDialog* dlg = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                   IID_PPV_ARGS(&dlg)))) {
+        DWORD opts = 0;
+        dlg->GetOptions(&opts);
+        dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+        dlg->SetTitle(L"Choose OSGB model folder");
+
+        std::error_code ec;
+        if (fs::is_directory(defaultDir, ec)) {
+            IShellItem* start = nullptr;
+            if (SUCCEEDED(SHCreateItemFromParsingName(
+                    fs::absolute(defaultDir, ec).wstring().c_str(), nullptr,
+                    IID_PPV_ARGS(&start)))) {
+                dlg->SetFolder(start);
+                start->Release();
+            }
+        }
+
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dlg->Show(GetActiveWindow())) && SUCCEEDED(dlg->GetResult(&item))) {
+            PWSTR psz = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &psz))) {
+                result = psz;
+                CoTaskMemFree(psz);
+            }
+            item->Release();
+        }
+        dlg->Release();
+    }
+    if (SUCCEEDED(hrInit)) CoUninitialize();
+    return result;
+#elif defined(__APPLE__)
     auto asQuote = [](const std::string& s) {
         std::string r;
         for (char c : s) { if (c == '"' || c == '\\') r += '\\'; r += c; }
@@ -166,7 +231,7 @@ static std::string pickFolderDialog(const fs::path& defaultDir) {
         pclose(p);
     }
     while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
-    return out;
+    return fs::path(out);
 #else
     (void)defaultDir;
     return {};
@@ -281,7 +346,7 @@ public:
 
     osg::ref_ptr<osg::Node> loadCurrent() const {
         if (files_.empty()) return nullptr;
-        return osgDB::readNodeFile(files_[currentIndex_].string());
+        return osgDB::readNodeFile(u8(files_[currentIndex_]));
     }
 
     void next()              { if (!files_.empty()) currentIndex_ = (currentIndex_ + 1) % files_.size(); }
@@ -326,7 +391,7 @@ public:
         modelGroup_->removeChildren(0, modelGroup_->getNumChildren());
 
         if (browser_.empty()) {
-            std::cerr << "No model files found in: " << dir.string() << "\n";
+            std::cerr << "No model files found in: " << u8(dir) << "\n";
             status_ = "No .osgb files found";
             setWindowName(viewer_, dirLabel() + " - no .osgb files");
             rebuildListPanel();
@@ -337,7 +402,7 @@ public:
 
     // 弹出文件夹选择框并切换
     void openFolder() {
-        std::string picked = pickFolderDialog(currentDir_);
+        fs::path picked = pickFolderDialog(currentDir_);
         if (!picked.empty()) loadDirectory(picked);
     }
 
@@ -348,7 +413,7 @@ public:
         osg::ref_ptr<osg::Node> node = browser_.loadCurrent();
         if (!node) {
             status_ = "Load FAILED";
-            std::string msg = "Failed to load: " + browser_.currentFile().filename().string();
+            std::string msg = "Failed to load: " + u8(browser_.currentFile().filename());
             std::cerr << msg << "\n";
             setWindowName(viewer_, msg);
             ensureCurrentVisible();
@@ -362,7 +427,7 @@ public:
         std::string title =
             "[" + std::to_string(browser_.index() + 1) + "/" +
             std::to_string(browser_.size()) + "] " +
-            browser_.currentFile().filename().string() +
+            u8(browser_.currentFile().filename()) +
             "  -  " + dirLabel();
         setWindowName(viewer_, title);
 
@@ -414,9 +479,9 @@ private:
         std::error_code ec;
         fs::path p = fs::weakly_canonical(currentDir_, ec);
         if (ec) p = currentDir_;
-        std::string name   = p.filename().string();
-        std::string parent = p.parent_path().filename().string();
-        if (name.empty())   return p.string();
+        std::string name   = u8(p.filename());
+        std::string parent = u8(p.parent_path().filename());
+        if (name.empty())   return u8(p);
         if (parent.empty()) return name;
         return parent + "/" + name;
     }
@@ -441,7 +506,7 @@ private:
         t->setAlignment(osgText::TextBase::LEFT_CENTER);
         t->setPosition(osg::Vec3(x, y, 0.5f));
         t->setColor(col);
-        t->setText(s);
+        t->setText(s, osgText::String::ENCODING_UTF8);
         g->addDrawable(t);
         listPanel_->addChild(g);
     }
@@ -493,7 +558,7 @@ private:
             line1Col.set(1, 0.4f, 0.4f, 1);
         }
         addPanelText(line1, LIST_X + 8, infoTop - 14, 14.0f, line1Col);
-        addPanelText(truncateName(browser_.currentFile().filename().string(), 32),
+        addPanelText(truncateName(u8(browser_.currentFile().filename()), 32),
                      LIST_X + 8, infoTop - 34, 14.0f, osg::Vec4(0.9f, 0.9f, 0.9f, 1));
 
         // 文件列表
@@ -521,7 +586,7 @@ private:
             }
 
             addPanelText(std::to_string(idx + 1) + ". " +
-                             truncateName(browser_.fileAt(idx).filename().string()),
+                             truncateName(u8(browser_.fileAt(idx).filename())),
                          LIST_X + 6, (yTop + yBot) * 0.5f, 13.0f,
                          isSel ? osg::Vec4(1, 1, 0.85f, 1)
                                : osg::Vec4(0.80f, 0.80f, 0.80f, 1));
@@ -644,10 +709,17 @@ private:
     float       scrollAccum_ = 0.0f;
 };
 
-// 若以 .app 包运行，把包内 Contents/Resources 加入 osgDB 插件搜索路径
-//（osgPlugins-x.x.x 目录放于其中），使打包后的程序不依赖系统安装的 OSG
+// 把随程序分发的 osgDB 插件目录（内含 osgPlugins-x.x.x）加入搜索路径首位，
+// 使打包后的程序不依赖系统安装的 OSG：
+// macOS 为 .app 包内 Contents/Resources，Windows 为 exe 所在目录
 static void addBundlePluginPath() {
-#ifdef __APPLE__
+#if defined(_WIN32)
+    wchar_t buf[MAX_PATH];
+    DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return;
+    osgDB::Registry::instance()->getLibraryFilePathList()
+        .push_front(u8(fs::path(buf).parent_path()));
+#elif defined(__APPLE__)
     char buf[PATH_MAX];
     uint32_t sz = sizeof(buf);
     if (_NSGetExecutablePath(buf, &sz) != 0) return;
@@ -661,13 +733,88 @@ static void addBundlePluginPath() {
 #endif
 }
 
+// ======================= 自检模式 =======================
+// 统计模型中纹理图像的加载情况（共享纹理只计一次）
+class TextureStats : public osg::NodeVisitor {
+public:
+    TextureStats() : osg::NodeVisitor(TRAVERSE_ALL_CHILDREN) {}
+    void apply(osg::Node& node) override {
+        check(node.getStateSet());
+        traverse(node);
+    }
+    int loaded  = 0;
+    int missing = 0;
+private:
+    void check(osg::StateSet* ss) {
+        if (!ss) return;
+        for (unsigned u = 0; u < ss->getTextureAttributeList().size(); ++u) {
+            auto* tex = dynamic_cast<osg::Texture*>(
+                ss->getTextureAttribute(u, osg::StateAttribute::TEXTURE));
+            if (!tex || !seen_.insert(tex).second) continue;
+            for (unsigned i = 0; i < tex->getNumImages(); ++i) {
+                const osg::Image* img = tex->getImage(i);
+                (img && img->data()) ? ++loaded : ++missing;
+            }
+        }
+    }
+    std::set<const osg::Texture*> seen_;
+};
+
+// 不开窗口，逐个加载目录下全部模型并报告结果，用于验证打包后的插件是否齐全。
+// 全部模型加载成功且无缺失纹理时返回 0
+static int runCheck(const fs::path& dir) {
+    std::vector<fs::path> files = collectModelFiles(dir);
+    int failed = 0, texLoaded = 0, texMissing = 0;
+    for (const fs::path& f : files) {
+        osg::ref_ptr<osg::Node> node = osgDB::readNodeFile(u8(f));
+        if (!node) {
+            ++failed;
+            std::cout << "FAILED  " << u8(f.filename()) << "\n";
+            continue;
+        }
+        TextureStats stats;
+        node->accept(stats);
+        texLoaded  += stats.loaded;
+        texMissing += stats.missing;
+        if (stats.missing)
+            std::cout << "NO-TEX  " << u8(f.filename()) << "  (" << stats.missing
+                      << " missing)\n";
+    }
+    std::cout << "models: " << files.size() << "  failed: " << failed
+              << "  textures loaded: " << texLoaded << "  missing: " << texMissing
+              << std::endl;
+    return (files.empty() || failed || texMissing) ? 1 : 0;
+}
+
+// 命令行参数（不含程序名）。Windows 的 argv 为 ANSI 编码，中文路径会丢字，改取宽字符命令行
+static std::vector<fs::path> commandLineArgs(int argc, char** argv) {
+    std::vector<fs::path> args;
+#ifdef _WIN32
+    (void)argc; (void)argv;
+    int wargc = 0;
+    if (LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc)) {
+        for (int i = 1; i < wargc; ++i) args.emplace_back(wargv[i]);
+        LocalFree(wargv);
+    }
+#else
+    for (int i = 1; i < argc; ++i) args.emplace_back(argv[i]);
+#endif
+    return args;
+}
+
 // ======================= 入口 =======================
+// 用法：ModelBrowser [目录]          打开浏览窗口
+//       ModelBrowser --check [目录]  无界面自检
 int main(int argc, char** argv) {
     addBundlePluginPath();
 
+    std::vector<fs::path> args = commandLineArgs(argc, argv);
+    if (!args.empty() && args[0] == "--check")
+        return runCheck(args.size() > 1 ? args[1] : fs::path("."));
+
     fs::path dir;
-    if (argc > 1 && argv[1][0] != '-') {
-        dir = argv[1];
+    if (!args.empty() && u8(args[0])[0] != '-') {
+        dir = args[0];
     } else {
         dir = ".";
         std::error_code ec;
