@@ -1,0 +1,12 @@
+{
+  "name": "osgb-browser",
+  "version-string": "1.1",
+  "description": "Windows 构建依赖（仅 CI 使用，macOS 构建走 Homebrew）",
+  "dependencies": [
+    {
+      "name": "osg",
+      "default-features": false,
+      "features": ["freetype", "plugins"]
+    }
+  ]
+}

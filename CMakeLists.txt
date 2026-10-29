@@ -29,6 +29,17 @@ if(APPLE)
     )
 endif()
 
+if(WIN32)
+    # GUI 程序（无控制台窗口），仍以 main() 为入口
+    set_target_properties(ModelBrowser PROPERTIES WIN32_EXECUTABLE ON)
+    if(MSVC)
+        target_link_options(ModelBrowser PRIVATE /ENTRY:mainCRTStartup)
+        target_compile_options(ModelBrowser PRIVATE /utf-8)
+    endif()
+    target_compile_definitions(ModelBrowser PRIVATE NOMINMAX UNICODE _UNICODE)
+    target_link_libraries(ModelBrowser PRIVATE ole32 shell32 uuid)
+endif()
+
 set_target_properties(ModelBrowser PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
