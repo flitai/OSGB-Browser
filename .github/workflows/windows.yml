@@ -16,6 +16,10 @@ env:
   VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-cache
   TRIPLET: x64-windows-release
 
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   windows:
     runs-on: windows-2022
@@ -36,7 +40,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: vcpkg-cache
-          key: vcpkg-${{ env.TRIPLET }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json') }}
+          key: vcpkg-${{ env.TRIPLET }}-${{ env.VCPKG_COMMIT }}-${{ github.run_id }}
           restore-keys: vcpkg-${{ env.TRIPLET }}-${{ env.VCPKG_COMMIT }}-
 
       - name: Configure (vcpkg installs OSG here)
@@ -47,13 +51,13 @@ jobs:
           "-DVCPKG_TARGET_TRIPLET=$env:TRIPLET"
           "-DVCPKG_HOST_TRIPLET=$env:TRIPLET"
 
-      # 首次编译依赖耗时较长，失败时也保存已编好的包，下次可续上
+      # 缓存 key 每次运行唯一、按前缀恢复最近一份：失败时也保存已编好的包，下次可续上
       - name: Save vcpkg binary cache
-        if: always() && steps.cache.outputs.cache-hit != 'true'
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: vcpkg-cache
-          key: vcpkg-${{ env.TRIPLET }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json') }}
+          key: vcpkg-${{ env.TRIPLET }}-${{ env.VCPKG_COMMIT }}-${{ github.run_id }}
 
       - name: Build
         run: cmake --build build --config Release
